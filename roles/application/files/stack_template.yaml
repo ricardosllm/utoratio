@@ -1,0 +1,808 @@
+Description: >
+  Creates the AWS resources needed for the Polly Batch Audiofile Generator application.
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: >
+      The email address to send notifications to when a new audiobook is created.
+    MinLength: 5
+
+  CodeBucket:
+    Type: String
+    Description: >
+      The name of the S3 bucket where the Docker and Lambda source code reside.
+    Default: aws-bigdata-blog
+
+  SourceCidr:
+    Type: "String"
+    Description: >
+      Optional - CIDR/IP range for instance outside access - defaults to 0.0.0.0/0
+    Default: "0.0.0.0/0"
+
+  VPC:
+    Type: "AWS::EC2::VPC::Id"
+    Description: The VPC ID to be used by the AWS Batch compute resources.
+
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      The list of private subnets to be used by the AWS Batch compute resources.
+
+  JobDefinitionVersion:
+    Type: String
+    Description: The job defintion version number
+    MinLength: 1
+    MaxLength: 2
+    Default: "1"
+
+  MaxCharLength:
+    Type: Number
+    Description: >
+      The maximum size of the input text can be used with the Amazon Polly
+      SynthesizeSpeech API Operation.
+    Default: 1500
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Mandatory Parameters"
+        Parameters:
+          - EmailAddress
+          - VPC
+          - PrivateSubnets
+      -
+        Label:
+          default: "Optional parameters"
+        Parameters:
+          - SourceCidr
+          - JobDefinitionVersion
+          - CodeBucket
+          - MaxCharLength
+    ParameterLabels:
+      EmailAddress:
+        default: "The email address to receive notifications"
+
+Resources:
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      NotificationConfiguration:
+        LambdaConfigurations:
+          -
+            Function: !GetAtt PollyBookUploadNotifierFunction.Arn
+            Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  -
+                    Name: suffix
+                    Value: .txt
+                  -
+                    Name: prefix
+                    Value: books/
+
+  S3BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          -
+            Action: "s3:GetObject"
+            Effect: "Allow"
+            Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+            Principal: "*"
+
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt PollyBookUploadNotifierFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "s3.amazonaws.com"
+      SourceAccount: !Ref "AWS::AccountId"
+
+  PollyBookUploadNotifierRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        -
+          PolicyName: book-processor-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "batch:SubmitJob"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  PollyBookUploadNotifierFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Creates an AWS Batch job when a new document is uploaded to S3
+      Environment:
+        Variables:
+          AWS_BATCH_JOB_QUEUE: polly_document_queue
+          AWS_BATCH_JOB_DEFINITION: !Sub polly_document_processor:${JobDefinitionVersion}
+          AWS_BATCH_JOB_NAME: polly_document
+          MAX_CHAR_LENGTH: !Ref MaxCharLength
+          SNS_TOPIC: !Ref SnsTopic
+      FunctionName: PollyBookUploadNotifier
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt PollyBookUploadNotifierRole.Arn
+      Runtime: nodejs4.3
+      Timeout: 10
+      Code:
+        ZipFile: |
+          'use strict';
+
+          console.log('Loading function');
+          const aws = require('aws-sdk');
+          const s3 = new aws.S3({ apiVersion: '2006-03-01' });
+          const batch = new aws.Batch({ apiVersion: '2016-08-10'});
+
+          var submitBatchJob = function submitBatchJob(bucket, key, topic, maxchars) {
+            var params = {
+              jobDefinition: process.env.AWS_BATCH_JOB_DEFINITION,
+              jobName: process.env.AWS_BATCH_JOB_NAME,
+              jobQueue: process.env.AWS_BATCH_JOB_QUEUE,
+              parameters: {
+                bucket: bucket,
+                key: key,
+                topic: topic,
+                maxchars: maxchars
+              }
+            };
+            return batch.submitJob(params).promise();
+          };
+
+          exports.handler = (event, context, callback) => {
+              //console.log('Received event:', JSON.stringify(event, null, 2));
+
+              // Get the object from the event and show its content type
+              const bucket = event.Records[0].s3.bucket.name;
+              const key = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
+              const topic = process.env.SNS_TOPIC;
+              const maxchars = process.env.MAX_CHAR_LENGTH;
+              submitBatchJob(bucket, key, topic, maxchars).then(function(data) {
+                console.log(data);
+                console.log('Success');
+                callback(null, data);
+              }).catch(function(err) {
+                callback(err);
+              });
+          };
+
+  CodeBuildTriggerFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        -
+          PolicyName: codebuild-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - codebuild:ListBuilds
+                  - codebuild:ListProjects
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: "*"
+
+  CodeBuildTriggerFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: CodeBuildTriggerResource
+      Handler: index.handler
+      Role: !GetAtt CodeBuildTriggerFunctionRole.Arn
+      Description: Custom CFN resource to starts the build of a CodeBuild project.
+      Runtime: nodejs4.3
+      Timeout: 30
+      Code:
+        ZipFile: |
+          var AWS = require('aws-sdk');
+          var response = require('cfn-response');
+          var http = require('https');
+          exports.handler = function(event, context) {
+              console.log('REQUEST RECEIVED');
+              console.log(event);
+              var src_url = event.ResourceProperties.SrcUrl;
+              if (event.RequestType != 'Create') {
+                  response.send(event, context, response.SUCCESS);
+                  return;
+              }
+              http.get(src_url, function(res) { // download the source code
+                var data = [];
+                var contentType = res.headers['content-type'];
+                var contentLength = res.headers['content-length'];
+                res.on('data', function(chunk) {
+                  data.push(chunk);
+                });
+                res.on('end', function() {
+                  var s3 = new AWS.S3();
+                  var buffer = Buffer.concat(data);
+                  var params = {Bucket: event.ResourceProperties.Bucket, Key: event.ResourceProperties.Key, Body: buffer, ContentType: contentType, ContentLength: contentLength};
+                  s3.upload(params, function(err, data) { // save the source code to the inventory bucket
+                    if (err) {
+                        console.log(err, err.stack); // an error occurred
+                        response.send(event, context, response.FAILED, err);
+                    } else {
+                      console.log(data);
+                      var codebuild = new AWS.CodeBuild();
+                      var params = { projectName: event.ResourceProperties.ProjectName };
+                      codebuild.startBuild(params, function(err, data) {
+                        if (err) {
+                          console.log(err, err.stack); // an error occurred
+                          response.send(event, context, response.FAILED, err);
+                        }
+                        else {
+                          console.log(data);           // successful response
+                          response.send(event, context, response.SUCCESS, data);
+                        }
+                      });
+                    }
+                  });
+                });
+              });
+          }
+
+  AWSBatchFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AWSBatchFullAccess
+      Policies:
+        -
+          PolicyName: awsbatch-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: "*"
+
+  AWSBatchComputeEnvFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: AWSBatchComputeEnvResource
+      Handler: index.handler
+      Role: !GetAtt AWSBatchFunctionRole.Arn
+      Description: Custom CFN resource to creates and delets an AWS Batch Compute Environment
+      Runtime: nodejs4.3
+      Timeout: 300
+      Code:
+        ZipFile: |
+          var AWS = require('aws-sdk');
+          var response = require('cfn-response');
+          exports.handler = function(event, context) {
+              console.log('REQUEST RECEIVED');
+              console.log(event);
+              var batch = new AWS.Batch();
+              if (event.RequestType == 'Create') {
+                var subnetParam;
+                if (event.ResourceProperties.Subnets instanceof Array) {
+                  subnetParam = event.ResourceProperties.Subnets;
+                } else {
+                  subnetParam = event.ResourceProperties.Subnets.split(',');
+                }
+                var securityGroupParam;
+                if (event.ResourceProperties.SecurityGroups instanceof Array) {
+                  securityGroupParam = event.ResourceProperties.SecurityGroups;
+                } else {
+                  securityGroupParam = event.ResourceProperties.SecurityGroups.split(',');
+                }
+                var params = {
+                    type: 'Managed',
+                    computeEnvironmentName: event.ResourceProperties.ComputeEnvName,
+                    serviceRole: event.ResourceProperties.ServiceRole,
+                    state: 'ENABLED',
+                    computeResources: {
+                        type: 'EC2',
+                        maxvCpus: event.ResourceProperties.MaxvCpus,
+                        desiredvCpus: event.ResourceProperties.DesiredvCpus,
+                        minvCpus: event.ResourceProperties.MinvCpus,
+                        instanceRole: event.ResourceProperties.InstanceProfile,
+                        instanceTypes: ['optimal'],
+                        subnets: subnetParam,
+                        securityGroupIds: securityGroupParam,
+                        tags: {
+                          "Name": "AWS Batch Instance"
+                        }
+                    }
+                };
+                batch.createComputeEnvironment(params, function(err, data) {
+                    if (err) {
+                      console.log(err, err.stack); // an error occurred
+                      response.send(event, context, response.FAILED, err);
+                    }
+                    else {
+                      console.log(data);           // successful response
+                      setTimeout(function(){
+                        response.send(event, context, response.SUCCESS, data);
+                      }, 60000);
+                    }
+                });
+              } else if (event.RequestType == 'Delete') {
+                var params = {
+                    computeEnvironment: event.ResourceProperties.ComputeEnvName,
+                    state: 'DISABLED'
+                };
+                batch.updateComputeEnvironment(params, function(err, data) {
+                  if (err) {
+                    console.log(err, err.stack); // an error occurred
+                    response.send(event, context, response.FAILED, err);
+                  }
+                  else {
+                    console.log(data);           // successful response
+                    console.log("Wait 90 secs to allow job queue to be deleted");
+                    setTimeout(function(){
+                      var params = {
+                          computeEnvironment: event.ResourceProperties.ComputeEnvName
+                      };
+                      batch.deleteComputeEnvironment(params, function(err, data) {
+                        if (err) {
+                          console.log(err, err.stack); // an error occurred
+                          response.send(event, context, response.FAILED, err);
+                        }
+                        else {
+                          console.log("Wait 120 sec to send response to allow resources to be deleted");
+                          setTimeout(function(){
+                            response.send(event, context, response.SUCCESS, data);
+                          }, 120000);
+                        }
+                      });
+                    }, 90000);
+                  }
+                });
+              } else {
+                  response.send(event, context, response.SUCCESS);
+                  return;
+              }
+          }
+
+  AWSBatchJobQueueFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: AWSBatchJobQueueResource
+      Handler: index.handler
+      Role: !GetAtt AWSBatchFunctionRole.Arn
+      Description: Custom CFN resource to create and delete AWS Batch Job Queues
+      Runtime: nodejs4.3
+      Timeout: 180
+      Code:
+        ZipFile: |
+          var AWS = require('aws-sdk');
+          var response = require('cfn-response');
+          exports.handler = function(event, context) {
+              console.log('REQUEST RECEIVED');
+              console.log(event);
+              var batch = new AWS.Batch();
+              if (event.RequestType == 'Create') {
+                var params = {
+                    computeEnvironmentOrder: [
+                        {
+                            computeEnvironment: event.ResourceProperties.ComputeEnvName,
+                            order: 1
+                        }
+                    ],
+                    jobQueueName: event.ResourceProperties.JobQueueName,
+                    priority: 10,
+                    state: 'ENABLED'
+                };
+                batch.createJobQueue(params, function(err, data) {
+                    if (err) {
+                      console.log(err, err.stack); // an error occurred
+                      response.send(event, context, response.FAILED, err);
+                    }
+                    else {
+                      console.log(data);           // successful response
+                      response.send(event, context, response.SUCCESS, data);
+                    }
+                });
+              } else if (event.RequestType == 'Delete') {
+                var params = {
+                    jobQueue: event.ResourceProperties.JobQueueName,
+                    state: 'DISABLED'
+                };
+                batch.updateJobQueue(params, function(err, data) {
+                  if (err) {
+                    console.log(err, err.stack); // an error occurred
+                    response.send(event, context, response.FAILED, err);
+                  }
+                  else {
+                    console.log(data);           // successful response
+                    console.log("Sleeping for 60 secs before deleting");
+                    setTimeout(function(){
+                      var params = { jobQueue: event.ResourceProperties.JobQueueName };
+                      batch.deleteJobQueue(params, function(err, data) {
+                        if (err) {
+                          console.log(err, err.stack); // an error occurred
+                          response.send(event, context, response.FAILED, err);
+                        }
+                        else {
+                          console.log(data);           // successful response
+                          response.send(event, context, response.SUCCESS, data);
+                        }
+                      });
+                    }, 60000);
+                  }
+                });
+              } else {
+                  response.send(event, context, response.SUCCESS);
+                  return;
+              }
+          }
+
+  AWSBatchJobDefinitionFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: AWSBatchJobDefinitionResource
+      Handler: index.handler
+      Role: !GetAtt AWSBatchFunctionRole.Arn
+      Description: Custom CFN resource to create and delete AWS Batch Job Definitions
+      Runtime: nodejs4.3
+      Timeout: 60
+      Code:
+        ZipFile: |
+          var AWS = require('aws-sdk');
+          var response = require('cfn-response');
+          exports.handler = function(event, context) {
+              console.log('REQUEST RECEIVED');
+              console.log(event);
+              var batch = new AWS.Batch();
+              if (event.RequestType == 'Create') {
+                contProps = event.ResourceProperties.ContainerProperties;
+                if ("mountPoints" in contProps) {
+                    contProps.mountPoints = contProps.mountPoints.map(function(item) {
+                        if ("readOnly" in item) {
+                          item.readOnly = ( item.readOnly.toLowerCase() == "true" );
+                        }
+                        return item;
+                    });
+                }
+                console.log(contProps);
+                var params = {
+                    type: "container",
+                    containerProperties: contProps,
+                    jobDefinitionName: event.ResourceProperties.JobDefinitionName
+                };
+                batch.registerJobDefinition(params, function(err, data) {
+                    if (err) {
+                      console.log(err, err.stack); // an error occurred
+                      response.send(event, context, response.FAILED, err);
+                    }
+                    else {
+                      console.log(data);           // successful response
+                      response.send(event, context, response.SUCCESS, data);
+                    }
+                });
+              } else if (event.RequestType == 'Delete') {
+                batch.describeJobDefinitions({ jobDefinitionName: event.ResourceProperties.JobDefinitionName}, function(err, data) {
+                  if (err) {
+                    console.log(err, err.stack); // an error occurred
+                    response.send(event, context, response.FAILED, err);
+                  } else {
+                    console.log(data);
+                    data.jobDefinitions.forEach(function(element) {
+                      console.log("Deregistering JobDefinitionArn: " + element.jobDefinitionArn);
+                      batch.deregisterJobDefinition({ jobDefinition: element.jobDefinitionArn }, function(err, data) {
+                        if (err) {
+                          console.log(err, err.stack); // an error occurred
+                          response.send(event, context, response.FAILED, err);
+                        }
+                        else {
+                          console.log(data);           // successful response
+                          response.send(event, context, response.SUCCESS, data);
+                        }
+                      });
+                    });
+                  }
+                });
+              } else {
+                  response.send(event, context, response.SUCCESS);
+                  return;
+              }
+          }
+
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: AWS Batch Beta Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        -
+          IpProtocol: "tcp"
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: !Ref SourceCidr
+
+  AWSBatchServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole"
+
+  EC2InstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+
+  InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref EC2InstanceRole
+
+  BatchJobRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonPollyReadOnlyAccess"
+      Policies:
+        -
+          PolicyName: "BatchJobPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: Allow
+                Action: "sns:Publish"
+                Resource: !Ref SnsTopic
+              -
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                Resource: "arn:aws:s3:::*"
+              -
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${S3Bucket}
+              -
+                Effect: Allow
+                Action: "s3:*"
+                Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+
+  PollyDocumentProcessorRepository:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      RepositoryName: polly_document_processor
+
+  CodeBuildServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "CodeBuildServicePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "arn:aws:logs:*:*:*"
+              -
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+
+  PollyBatchDocumentProcessorBuild:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: PollyBatchDocumentProcessorBuild
+      Description: Builds the Polly Batch Document Processor Docker image used by the AWS Batch service
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: no_artifacts
+      Source:
+        Type: S3
+        Location: !Sub ${S3Bucket}/docker/src/PollyDocumentProcessor.zip
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/docker:1.12.1
+        EnvironmentVariables:
+          -
+            Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          -
+            Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          -
+            Name: IMAGE_REPO_NAME
+            Value: !Ref PollyDocumentProcessorRepository
+          -
+            Name: IMAGE_TAG
+            Value: latest
+
+  CodeBuildTrigger:
+    Type: Custom::CodeBuildTrigger
+    DependsOn: [ "PollyBatchDocumentProcessorBuild", "PollyDocumentProcessorRepository" ]
+    Properties:
+      ServiceToken: !GetAtt CodeBuildTriggerFunction.Arn
+      ProjectName: !Ref PollyBatchDocumentProcessorBuild
+      Bucket: !Ref S3Bucket
+      Key: docker/src/PollyDocumentProcessor.zip
+      SrcUrl: !Sub https://s3.amazonaws.com/${CodeBucket}/artifacts/PollyBatch/docker/src/PollyDocumentProcessor.zip
+
+  BatchComputeEnvResource:
+    Type: Custom::BatchComputeEnvResource
+    Properties:
+      ServiceToken: !GetAtt AWSBatchComputeEnvFunction.Arn
+      Subnets: !Ref PrivateSubnets
+      SecurityGroups: !Ref SecurityGroup
+      ServiceRole: !GetAtt AWSBatchServiceRole.Arn
+      InstanceProfile: !Ref InstanceProfile
+      ComputeEnvName: "PollyDocumentComputeEnvironment"
+      MaxvCpus: 128
+      MinvCpus: 0
+      DesiredvCpus: 16
+
+  BatchJobQueueResource:
+    Type: Custom::BatchJobQueueResource
+    DependsOn:
+      - BatchComputeEnvResource
+      - AWSBatchJobQueueFunction
+    Properties:
+      ServiceToken: !GetAtt AWSBatchJobQueueFunction.Arn
+      ComputeEnvName: "PollyDocumentComputeEnvironment"
+      JobQueueName: "polly_document_queue"
+
+  BatchJobDefinitionResource:
+    Type: Custom::BatchJobDefinitionResource
+    Properties:
+      ServiceToken: !GetAtt AWSBatchJobDefinitionFunction.Arn
+      ContainerProperties:
+        command: [ "-b", "Ref::bucket", "-k", "Ref::key", "-t", "Ref::topic", "-m", "Ref::maxchars" ]
+        vcpus: 16
+        memory: 2048
+        image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/polly_document_processor
+        jobRoleArn: !GetAtt BatchJobRole.Arn
+        environment:
+          -
+            name: AUDIOFILE_TMP_DIR
+            value: "/audio"
+        mountPoints:
+          -
+            sourceVolume: audiofiles
+            containerPath: "/audio"
+            readOnly: false
+        volumes:
+          -
+            name: audiofiles
+            host:
+              sourcePath: "/tmp/audiofiles"
+      JobDefinitionName: polly_document_processor
+
+  SnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        -
+          Endpoint: !Ref EmailAddress
+          Protocol: "email"
+      TopicName: "AudiobookTopic"
+
+Outputs:
+  S3Bucket:
+    Description: The S3 bucket where the books should be uploaded to.
+    Value: !Ref S3Bucket

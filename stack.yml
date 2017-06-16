@@ -1,0 +1,19 @@
+- name: Create or Update CloudFormation Stack
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+  - include_vars: 'group_vars/{{ env }}.yml'
+
+  roles:
+    - role: network
+      template_parameters:
+        VpcName: '{{ project_name }}-VPC'
+
+    - role: application
+      template_parameters:
+        EmailAddress:   '{{ admin_email }}'
+        CodeBucket:     '{{ project_name }}-source-{{ env }}'
+        SourceCidr:     '0.0.0.0/0' # instance outside access
+        VPC:            '{{ network_stack.stack_output.VPC }}'
+        PrivateSubnets: '{{ network_stack.stack_output.PrivateSubnets }}'
