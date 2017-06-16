@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/ricardosllm/utoratio.svg?branch=master)](https://travis-ci.org/ricardosllm/utoratio)
+
 # Ut Oratio
 
 Converts text documents into speech using [AWS Polly](https://aws.amazon.com/polly/) service
